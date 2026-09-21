@@ -172,12 +172,38 @@ That cost is charged once per statement text per connection:
 - **Simple queries never probe.** `psql` typing a statement at the prompt sends
   no `Describe`, so this whole path is skipped.
 
+## Where the 190 ms goes
+
+Almost none of it is the Data API. Measured from the same machine against the
+regional endpoints, fastest of five attempts each:
+
+| | TCP round trip | one request on a warm TLS connection |
+| --- | --- | --- |
+| `rds-data.us-east-1.amazonaws.com` | 171.5 ms | 172.8 ms |
+| `rds-data.ap-northeast-1.amazonaws.com` | 7.2 ms | 8.4 ms |
+
+An `ExecuteStatement` against the us-east-1 cluster took 176.7 ms at its fastest
+and 192–195 ms at the median. Take the round trip away and roughly 5–20 ms is
+left for everything the service actually does: authenticating the caller,
+resolving the secret, reaching the cluster, running the statement and
+serialising the result.
+
+The Data API is thin, in other words. What is expensive here is the ocean.
+
+On those round trips, a cluster in the caller's own region would be expected to
+answer in about 25 ms, which would put the first-`Describe` probe — five calls —
+at about 125 ms rather than 930 ms. That is arithmetic from measured round
+trips, not a measurement: there was no in-region cluster to point the harness
+at.
+
 ## What this does not measure
 
 - **Concurrency.** Every number here is one statement at a time. Throughput
   under parallel load, and whether the Data API throttles it, is untested.
-- **In-region latency.** The absolute milliseconds come from one distance. Only
-  the call counts carry over unchanged.
+- **In-region latency.** No cluster in the caller's own region was available, so
+  the ~25 ms above is inferred from the endpoint's round trip rather than
+  observed. Only the call counts carry over from one distance to another
+  unchanged.
 - **Large results.** The 1 MB cap and what happens near it is a correctness
   question, covered in [COMPATIBILITY.md](../COMPATIBILITY.md), not a timing one.
 
