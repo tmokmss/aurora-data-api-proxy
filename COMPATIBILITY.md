@@ -133,12 +133,36 @@ twice.
 
 ## Performance
 
-Every statement is an HTTP round trip, so expect single-digit to low tens of
-milliseconds per query rather than the sub-millisecond of a local socket. Two
-things cost extra:
+Every statement is an HTTP round trip rather than the sub-millisecond of a local
+socket, and that round trip is nearly the whole cost: the proxy's own
+translation does not show up next to it.
+
+`cargo run --release --example overhead` measures this against a real cluster.
+It runs both halves in one process, interleaved, and subtracts each round from
+its neighbour so that network drift cancels instead of drowning the answer. Two
+runs from outside the region, where one Data API call took 186–200 ms:
+
+| | Data API calls | versus calling the Data API yourself |
+| --- | --- | --- |
+| A query, statement already seen | 1 | +0.3 ms and −0.2 ms at the median |
+| The same query returning 1000 rows | 1 | +0.6 ms and +1.0 ms at the median |
+| Opening a connection | 0 | 0.2 ms, no call at all |
+| `Describe` of a statement seen before | 0 | 0.2 ms, no call at all |
+| `Describe` of a statement not seen before | **5** | five extra round trips |
+
+So two things cost extra, and only one of them is large:
 
 - `Describe(statement)` runs a probe — `BEGIN`, `PREPARE`, a catalogue read, a
   shape query, `ROLLBACK` — the first time a connection sees a given statement.
-  The result is cached per connection by SQL text, so repeated use is free.
+  That is five extra Data API calls: the first use of a statement costs six
+  round trips where a direct caller pays one. The shape is then cached per
+  connection by SQL text, so every later use of that text is free. The cache
+  dies with the connection, so a pool that opens a connection per request
+  re-probes everything; a long-lived connection pays once. Simple queries never
+  probe, because nothing asks the proxy to describe anything.
 - A scaled-to-zero cluster takes 10–30 seconds to wake. The proxy retries
   `DatabaseResumingException` with backoff for `--resume-timeout-secs`.
+
+The millisecond figures belong to one laptop and one region pairing. The call
+counts do not: one call per query, five extra on a first `Describe`, is what
+holds wherever it runs.
