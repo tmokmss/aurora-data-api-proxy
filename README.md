@@ -30,17 +30,8 @@ psql (18.3, server 17.9)
 postgres=> select * from orders limit 3;
 ```
 
-Every option is a flag or an environment variable:
-
-| Flag | Environment | Default | Meaning |
-| --- | --- | --- | --- |
-| `--cluster-arn` | `CLUSTER_ARN` | *required* | The Aurora cluster to query |
-| `--secret-arn` | `SECRET_ARN` | *required* | Secrets Manager secret with the database credentials |
-| `--database` | `DATABASE` | *required* | Database to connect to |
-| `--listen` | `LISTEN` | `127.0.0.1:5432` | Address to listen on |
-| `--region` | `AWS_REGION` | from the credential chain | AWS region |
-| `--resume-timeout-secs` | `RESUME_TIMEOUT_SECS` | `90` | How long to wait for a scaled-to-zero cluster to wake |
-| `--log-level` | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
+`--help` lists every option, with the environment variable and the default
+that go with it.
 
 AWS credentials come from the standard chain: environment, `AWS_PROFILE`, SSO,
 instance or task role. The cluster needs the Data API enabled
