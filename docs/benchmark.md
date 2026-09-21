@@ -174,36 +174,64 @@ That cost is charged once per statement text per connection:
 
 ## Where the 190 ms goes
 
-Almost none of it is the Data API. Measured from the same machine against the
-regional endpoints, fastest of five attempts each:
+Almost none of it is the Data API. [`scripts/in-region-latency.py`](../scripts/in-region-latency.py)
+answers this by measuring one thing the harness above does not: an
+**unauthenticated POST to the same endpoint on a kept-open connection**. The
+service rejects it at the front door, so it carries the network, the TLS
+session and the endpoint's dispatch, and none of the authenticating,
+secret-resolving or querying. The gap between that and a real call is the work.
 
-| | TCP round trip | one request on a warm TLS connection |
-| --- | --- | --- |
-| `rds-data.us-east-1.amazonaws.com` | 171.5 ms | 172.8 ms |
-| `rds-data.ap-northeast-1.amazonaws.com` | 7.2 ms | 8.4 ms |
+Run from a laptop far outside the region and from CloudShell inside it, within
+minutes of each other, against the same cluster:
 
-An `ExecuteStatement` against the us-east-1 cluster took 176.7 ms at its fastest
-and 192–195 ms at the median. Take the round trip away and roughly 5–20 ms is
-left for everything the service actually does: authenticating the caller,
-resolving the secret, reaching the cluster, running the statement and
-serialising the result.
+| | network floor | `ExecuteStatement` floor | the service's own work |
+| --- | --- | --- | --- |
+| outside the region | 170.6 ms | 179.6 ms | **9.0 ms** |
+| CloudShell, in `us-east-1` | 1.5 ms | 17.4 ms | **15.9 ms** |
 
-The Data API is thin, in other words. What is expensive here is the ocean.
+So a Data API call inside its own region is **about 17 ms**, observed, and the
+190 ms seen from across an ocean is 172 ms of ocean and roughly ten of service.
+The Data API is thin. What is expensive is the distance.
 
-On those round trips, a cluster in the caller's own region would be expected to
-answer in about 25 ms, which would put the first-`Describe` probe — five calls —
-at about 125 ms rather than 930 ms. That is arithmetic from measured round
-trips, not a measurement: there was no in-region cluster to point the harness
-at.
+That also prices the probe: five calls is about **90 ms in-region** against the
+930 ms measured from outside it.
+
+### Why the floor, and not the median
+
+Those figures are floors because from CloudShell the median cannot be trusted,
+and the output says so itself: it reported a thousand rows arriving 19 ms
+*faster* than one row, which no database does. Something in that wall clock is
+neither the network nor the service.
+
+It is the client. The script's fixed 2M-iteration reference loop took 125 ms on
+one CloudShell run and 252 ms on the next — the same machine, twice the time,
+which is the signature of a throttled container rather than a slow one. Time
+spent waiting for the scheduler lands in the wall clock and not in
+`process_time`, so it is invisible to the per-call CPU figure and arrives
+looking like service latency.
+
+A floor is immune to this, because a stall can only ever add. Both floors are
+small, both agree to within single-digit milliseconds, and the remaining gap
+between them (9.0 against 15.9) is about what a client two to three times
+slower would spend on TLS and JSON. The medians, from a quiet machine, agree
+too: 182.2 ms against a 172.2 ms baseline is 10.0 ms of service, next to the
+9.0 ms floor.
+
+None of this changes the proxy's own numbers above. Those were measured on the
+quiet machine, and they are differences between two things measured on it, so
+whatever the host costs cancels.
 
 ## What this does not measure
 
 - **Concurrency.** Every number here is one statement at a time. Throughput
   under parallel load, and whether the Data API throttles it, is untested.
-- **In-region latency.** No cluster in the caller's own region was available, so
-  the ~25 ms above is inferred from the endpoint's round trip rather than
-  observed. Only the call counts carry over from one distance to another
-  unchanged.
+- **The proxy in its own region.** The ~17 ms in-region call above was measured
+  with a plain Data API client in CloudShell, not with the proxy: there is no
+  in-region host running it. The proxy's share should not change, since it is
+  local work either way, but that is reasoning rather than a measurement.
+- **Why a CloudShell median is inflated.** That it is inflated is established;
+  that CFS throttling is the mechanism is the obvious candidate and was not
+  proven. The floors are used instead, which does not depend on the answer.
 - **Large results.** The 1 MB cap and what happens near it is a correctness
   question, covered in [COMPATIBILITY.md](../COMPATIBILITY.md), not a timing one.
 
@@ -219,3 +247,14 @@ $ AWS_PROFILE=... AWS_REGION=us-east-1 \
 
 CI does not run it. It needs a real cluster, and unlike the integration tests it
 is meant to be run enough times to be worth the API calls it makes.
+
+For the Data API on its own, with the distance taken out, open CloudShell in the
+cluster's region — the identity is already there, and nothing has to be created:
+
+```console
+$ curl -sO https://raw.githubusercontent.com/tmokmss/aurora-data-api-proxy/main/scripts/in-region-latency.py
+$ python3 in-region-latency.py <db-cluster-identifier>
+```
+
+It prints every sample, not only percentiles, which is what made the inflated
+CloudShell median visible rather than believable.
