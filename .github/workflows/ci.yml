@@ -35,9 +35,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux for the sidecar case, macOS because the main use of this proxy
-        # is a developer's own machine.
-        os: [ubuntu-22.04, macos-latest]
+        # Every platform a release ships a binary for, so nothing is
+        # distributed untested. macOS is arm64 and covers both Apple targets;
+        # x86_64-apple-darwin is cross-compiled from it at release time.
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
