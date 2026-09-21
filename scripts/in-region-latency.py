@@ -30,11 +30,15 @@ wall clock. Three things can be, and each is measured rather than assumed:
 The statements only read, and nothing is created.
 """
 
+import http.client
+import os.path
 import socket
+import ssl
 import sys
 import time
 
 import boto3
+import botocore
 from botocore.config import Config
 
 ITERS = 40
@@ -77,6 +81,49 @@ def tcp_rtt(host):
     elapsed = (time.perf_counter() - start) * 1000
     sock.close()
     return elapsed
+
+
+def open_front_door(endpoint):
+    """An HTTPS connection to the endpoint, or None if one cannot be had.
+
+    The CA bundle comes from botocore rather than the interpreter's, because a
+    Python that cannot verify a certificate on its own is common enough that
+    losing the whole measurement to it would be silly.
+    """
+    bundle = os.path.join(os.path.dirname(botocore.__file__), "cacert.pem")
+    context = ssl.create_default_context(
+        cafile=bundle if os.path.exists(bundle) else None
+    )
+    conn = http.client.HTTPSConnection(endpoint, timeout=10, context=context)
+    conn.request(
+        "POST", "/Execute", body="{}", headers={"Content-Type": "application/json"}
+    )
+    conn.getresponse().read()
+    return conn
+
+
+def unsigned_rtt(conn):
+    """One HTTPS request and response on an already-open connection.
+
+    The request carries no credentials, so the service rejects it at the front
+    door: this is the network, the TLS session and the endpoint's dispatch,
+    with none of the authenticating, secret-resolving or querying that a real
+    call pays for. The gap between this and `ExecuteStatement` is the work.
+    """
+    start = time.perf_counter()
+    conn.request(
+        "POST", "/Execute", body="{}", headers={"Content-Type": "application/json"}
+    )
+    response = conn.getresponse()
+    response.read()
+    return (time.perf_counter() - start) * 1000
+
+
+def series(label, samples):
+    """Print every sample, because a percentile hides the shape of a split."""
+    print(f"  {label}")
+    for start in range(0, len(samples), 10):
+        print("   " + "".join(f"{s:8.1f}" for s in samples[start : start + 10]))
 
 
 def cpu_reference():
@@ -160,6 +207,15 @@ def main():
     cpu = {name: [] for name, _, _ in variants}
     by_position = [[] for _ in variants]
     rtts = []
+    unsigned = []
+
+    # Kept open across rounds, so its samples are warm-connection round trips
+    # rather than handshakes.
+    try:
+        front_door = open_front_door(endpoint)
+    except Exception as e:  # noqa: BLE001 - any failure here is only a lost row
+        print(f"  (no unsigned probe: {type(e).__name__}: {e})")
+        front_door = None
 
     print(f"measuring {ITERS} rounds...")
     for i in range(ITERS):
@@ -167,6 +223,15 @@ def main():
         # its own, so that subtracting one from the other compares samples that
         # saw the same network instead of two different minutes of it.
         rtts.append(tcp_rtt(endpoint))
+        if front_door is not None:
+            try:
+                unsigned.append(unsigned_rtt(front_door))
+            except Exception:  # noqa: BLE001 - reconnect and carry on
+                try:
+                    front_door = open_front_door(endpoint)
+                    unsigned.append(unsigned_rtt(front_door))
+                except Exception:  # noqa: BLE001
+                    front_door = None
 
         # Rotated, so that no one statement is always the first of a round.
         shift = i % len(variants)
@@ -185,7 +250,9 @@ def main():
 
     print(f"\n=== the Data API, measured from here, region {region} ===\n")
     header()
-    row("TCP round trip to the endpoint", rtts)
+    row("TCP handshake to the endpoint", rtts)
+    if unsigned:
+        row("unsigned POST, warm connection (403)", unsigned)
     for name, _, _ in variants:
         row(name, wall[name])
 
@@ -211,9 +278,15 @@ def main():
 
     print("\nwhat is left after the round trip is taken away:")
     print(
-        f"  paired, round by round    median {pct(paired, 0.5):>7.1f} ms,"
+        f"  versus the handshake      median {pct(paired, 0.5):>7.1f} ms,"
         f" p90 {pct(paired, 0.9):.1f} ms"
     )
+    if unsigned:
+        door = sorted(m - u for m, u in zip(meta, unsigned))
+        print(
+            f"  versus the unsigned POST  median {pct(door, 0.5):>7.1f} ms,"
+            f" p90 {pct(door, 0.9):.1f} ms"
+        )
     print(f"  floor to floor            {min(meta) - min(rtts):>7.1f} ms")
     print(
         f"  of which this client      {pct(meta_cpu, 0.5):>7.1f} ms"
@@ -228,6 +301,15 @@ def main():
             "  That is negative, which cannot be true of the database. Check the\n"
             "  drift and position lines above before believing any number here."
         )
+
+    # A percentile cannot show a distribution that is split in two, and a split
+    # is what a fixed stall looks like from the outside.
+    print("\nevery sample, in the order it was taken:")
+    series("TCP handshake", rtts)
+    if unsigned:
+        series("unsigned POST (403)", unsigned)
+    for name, _, _ in variants:
+        series(name, wall[name])
 
 
 if __name__ == "__main__":
