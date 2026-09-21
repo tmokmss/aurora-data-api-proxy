@@ -138,7 +138,28 @@ milliseconds per query rather than the sub-millisecond of a local socket. Two
 things cost extra:
 
 - `Describe(statement)` runs a probe — `BEGIN`, `PREPARE`, a catalogue read, a
-  shape query, `ROLLBACK` — the first time a connection sees a given statement.
-  The result is cached per connection by SQL text, so repeated use is free.
+  shape query, `ROLLBACK` — the first time the proxy sees a given statement.
+  That is five extra Data API calls, so the first use of a statement costs six
+  round trips where a direct caller pays one.
+
+  The answer is then kept, keyed by SQL text, and **shared between every
+  connection in the process**. A statement's shape belongs to the schema rather
+  than to whoever asked, so a pool that opens a connection per request — or a
+  Lambda whose handler reconnects — pays for a statement once rather than once
+  per request. Simple queries never probe at all.
+
+  Two things are deliberately excluded from the sharing. A probe that had to
+  run inside the caller's own transaction is kept to that connection, because a
+  `SET LOCAL`, a temporary table or uncommitted DDL are visible only there. And
+  any statement beginning `CREATE`, `ALTER`, `DROP`, `REINDEX` or `REFRESH`
+  empties the cache as it goes past, because a column added or retyped
+  underneath a remembered shape would leave a client decoding rows against a
+  description that no longer matches them.
+
+  What the proxy cannot see is DDL that reaches the cluster by another route:
+  a migration run from elsewhere while this proxy is up leaves it describing
+  statements from a stale cache. `--describe-cache connection` narrows that
+  window to a single connection's lifetime, at the cost of probing again on
+  every new connection.
 - A scaled-to-zero cluster takes 10–30 seconds to wake. The proxy retries
   `DatabaseResumingException` with backoff for `--resume-timeout-secs`.

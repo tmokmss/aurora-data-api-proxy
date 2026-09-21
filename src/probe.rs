@@ -72,14 +72,24 @@ pub async fn describe_statement(
         return Ok(cached);
     }
 
-    let shape = Arc::new(run_probe(session, sql).await?);
-    session.cache_shape(sql.to_string(), shape.clone()).await;
+    let (shape, shareable) = run_probe(session, sql).await?;
+    let shape = Arc::new(shape);
+    session
+        .cache_shape(sql.to_string(), shape.clone(), shareable)
+        .await;
     Ok(shape)
 }
 
-async fn run_probe(session: &Session, sql: &str) -> Result<StatementShape, ErrorInfo> {
+/// Work out a shape, and say whether the answer belongs to the schema.
+///
+/// A probe that opened its own transaction saw the database the way every
+/// connection sees it. A probe that borrowed the caller's transaction did not:
+/// a `SET LOCAL`, a temporary table or DDL the caller has not committed are all
+/// visible inside it and to nobody else, so its answer cannot be lent out.
+async fn run_probe(session: &Session, sql: &str) -> Result<(StatementShape, bool), ErrorInfo> {
     let suffix = unique_suffix();
     let (tx, cleanup) = begin_probe(session, &suffix).await?;
+    let shareable = matches!(cleanup, Cleanup::OwnedTransaction);
 
     let result = probe_inner(session, sql, &suffix, &tx).await;
 
@@ -87,7 +97,7 @@ async fn run_probe(session: &Session, sql: &str) -> Result<StatementShape, Error
     if let Err(e) = end_probe(session, &tx, cleanup).await {
         tracing::warn!("could not clean up after a describe probe: {}", e.message);
     }
-    result
+    result.map(|shape| (shape, shareable))
 }
 
 /// Get a transaction to probe in, without endangering the caller's.

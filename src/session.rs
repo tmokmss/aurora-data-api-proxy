@@ -42,6 +42,76 @@ struct Pending {
     tag: Tag,
 }
 
+/// How many statement shapes one cache holds before starting over.
+const SHAPE_CACHE_LIMIT: usize = 512;
+
+/// Statement shapes every connection in this process can use.
+///
+/// A shape is a property of the schema rather than of a connection, so the
+/// five Data API calls that work one out need not be paid again by the next
+/// connection to ask. That matters most where connections are short: a pool
+/// that opens one per request, or a Lambda whose handler reconnects, otherwise
+/// probes every statement every time.
+///
+/// It is deliberately empty when constructed and deliberately easy to clear.
+/// See [`Session::forget_shapes`] for when it is.
+#[derive(Debug, Default)]
+pub struct SharedShapes {
+    entries: Mutex<HashMap<String, Arc<StatementShape>>>,
+    /// Off means every `insert` is dropped on the floor, which is what
+    /// `--describe-cache connection` asks for.
+    shared: bool,
+}
+
+impl SharedShapes {
+    /// A store that connections share.
+    pub fn shared() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            shared: true,
+        }
+    }
+
+    /// A store that never holds anything, leaving each connection its own.
+    pub fn disabled() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            shared: false,
+        }
+    }
+
+    async fn get(&self, sql: &str) -> Option<Arc<StatementShape>> {
+        if !self.shared {
+            return None;
+        }
+        self.entries.lock().await.get(sql).cloned()
+    }
+
+    async fn insert(&self, sql: String, shape: Arc<StatementShape>) {
+        if !self.shared {
+            return;
+        }
+        let mut entries = self.entries.lock().await;
+        if entries.len() >= SHAPE_CACHE_LIMIT {
+            entries.clear();
+        }
+        entries.insert(sql, shape);
+    }
+
+    async fn clear(&self) {
+        self.entries.lock().await.clear();
+    }
+
+    /// How many shapes are held. For tests.
+    pub async fn len(&self) -> usize {
+        self.entries.lock().await.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+}
+
 /// Everything one client connection remembers.
 pub struct Session {
     api: DataApi,
@@ -50,6 +120,9 @@ pub struct Session {
     /// rejects everything but a rollback in that state, and so must we.
     failed: Mutex<bool>,
     describe_cache: Mutex<HashMap<String, Arc<StatementShape>>>,
+    /// Shapes this connection may take from and add to, shared with the rest
+    /// of the process.
+    shapes: Arc<SharedShapes>,
     pending: Mutex<HashMap<usize, Pending>>,
 }
 
@@ -60,12 +133,13 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
-    pub fn new(api: DataApi) -> Self {
+    pub fn new(api: DataApi, shapes: Arc<SharedShapes>) -> Self {
         Self {
             api,
             transaction: Mutex::new(None),
             failed: Mutex::new(false),
             describe_cache: Mutex::new(HashMap::new()),
+            shapes,
             pending: Mutex::new(HashMap::new()),
         }
     }
@@ -161,17 +235,42 @@ impl Session {
     // -- the statement shape cache ------------------------------------------
 
     pub async fn cached_shape(&self, sql: &str) -> Option<Arc<StatementShape>> {
-        self.describe_cache.lock().await.get(sql).cloned()
+        if let Some(shape) = self.describe_cache.lock().await.get(sql).cloned() {
+            return Some(shape);
+        }
+        self.shapes.get(sql).await
     }
 
-    pub async fn cache_shape(&self, sql: String, shape: Arc<StatementShape>) {
+    /// Remember what a probe worked out.
+    ///
+    /// `shareable` says whether the answer belongs to the schema or only to
+    /// this connection. A probe that ran inside the caller's own transaction
+    /// could have seen a `SET LOCAL search_path`, a temporary table or
+    /// uncommitted DDL, none of which another connection can see, so those
+    /// answers stay here. A probe that opened its own transaction saw the
+    /// database as everyone else sees it, and is worth sharing.
+    pub async fn cache_shape(&self, sql: String, shape: Arc<StatementShape>, shareable: bool) {
+        if shareable {
+            self.shapes.insert(sql.clone(), shape.clone()).await;
+        }
         // A connection that prepares an unbounded number of distinct
         // statements should not grow this without limit.
         let mut cache = self.describe_cache.lock().await;
-        if cache.len() >= 512 {
+        if cache.len() >= SHAPE_CACHE_LIMIT {
             cache.clear();
         }
         cache.insert(sql, shape);
+    }
+
+    /// Throw away every remembered shape, here and process-wide.
+    ///
+    /// Called when a statement goes through that could have changed what a
+    /// shape would be. It is cheap -- the next `Describe` of each statement
+    /// probes again -- and the alternative is describing a statement to a
+    /// client in terms that no longer match what it will receive.
+    pub async fn forget_shapes(&self) {
+        self.describe_cache.lock().await.clear();
+        self.shapes.clear().await;
     }
 
     // -- results held between Describe and Execute --------------------------
@@ -239,5 +338,53 @@ mod tests {
         };
         assert_eq!(shape.param_types.len(), 2);
         assert!(shape.fields.is_empty(), "no fields means no rows");
+    }
+
+    fn shape(name: &str) -> Arc<StatementShape> {
+        Arc::new(StatementShape {
+            param_types: vec![Some(name.to_string())],
+            fields: vec![],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_shared_store_hands_one_connections_answer_to_the_next() {
+        let shapes = SharedShapes::shared();
+        shapes.insert("select 1".into(), shape("int4")).await;
+
+        let found = shapes.get("select 1").await.expect("the shape");
+        assert_eq!(found.param_types, vec![Some("int4".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_store_keeps_nothing() {
+        let shapes = SharedShapes::disabled();
+        shapes.insert("select 1".into(), shape("int4")).await;
+
+        assert!(
+            shapes.get("select 1").await.is_none(),
+            "--describe-cache connection must not share across connections"
+        );
+        assert!(shapes.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn a_shared_store_starts_over_rather_than_growing_forever() {
+        let shapes = SharedShapes::shared();
+        for i in 0..=SHAPE_CACHE_LIMIT {
+            shapes.insert(format!("select {i}"), shape("int4")).await;
+        }
+        assert!(
+            shapes.len().await <= SHAPE_CACHE_LIMIT,
+            "a process that sees unbounded distinct SQL must not grow without limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_leaves_nothing_behind() {
+        let shapes = SharedShapes::shared();
+        shapes.insert("select 1".into(), shape("int4")).await;
+        shapes.clear().await;
+        assert!(shapes.get("select 1").await.is_none());
     }
 }

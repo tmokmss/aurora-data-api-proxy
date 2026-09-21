@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use aurora_data_api_proxy::config::Config;
+use aurora_data_api_proxy::config::{Config, DescribeCache};
 use aurora_data_api_proxy::dataapi::{DataApi, Outcome};
 use aurora_data_api_proxy::handlers::ProxyFactory;
+use aurora_data_api_proxy::session::SharedShapes;
 use clap::Parser;
 use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
@@ -66,7 +67,11 @@ async fn main() -> Result<()> {
     }
     tracing::info!("listening on {}", config.listen);
 
-    let factory = Arc::new(ProxyFactory::new(api, server_version));
+    let shapes = Arc::new(match config.describe_cache {
+        DescribeCache::Process => SharedShapes::shared(),
+        DescribeCache::Connection => SharedShapes::disabled(),
+    });
+    let factory = Arc::new(ProxyFactory::with_shapes(api, server_version, shapes));
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(v) => v,
