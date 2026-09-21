@@ -3,8 +3,15 @@
 //! `Describe(statement)` arrives before `Bind`, so the proxy has to answer it
 //! with no parameter values in hand: the parameter types, and the result
 //! columns, of a statement that has never been executed. The Data API offers
-//! nothing for this, so the proxy asks PostgreSQL directly, through the one
-//! stateful thing the Data API does have -- a transaction.
+//! nothing for this, so the proxy asks PostgreSQL directly.
+//!
+//! A statement with no placeholders is asked in one call. Wrapped as
+//! `SELECT * FROM (<query>) WHERE false`, it comes back with the column names
+//! and types and no rows, and nothing about it needs a session to be held open
+//! from one call to the next. That is the common case and it is the cheap one.
+//!
+//! Everything else goes the long way round, through the one stateful thing the
+//! Data API does have -- a transaction.
 //!
 //! Inside a transaction the Data API pins one backend session, which means a
 //! `PREPARE` in one call is still there for the next. That gives
@@ -72,12 +79,71 @@ pub async fn describe_statement(
         return Ok(cached);
     }
 
-    let (shape, shareable) = run_probe(session, sql).await?;
+    let (shape, shareable) = if one_call_is_enough(session, sql).await {
+        let fields = select_fields(session, sql, &[], None).await?;
+        (
+            StatementShape {
+                param_types: Vec::new(),
+                fields,
+            },
+            true,
+        )
+    } else {
+        run_probe(session, sql).await?
+    };
+
     let shape = Arc::new(shape);
     session
         .cache_shape(sql.to_string(), shape.clone(), shareable)
         .await;
     Ok(shape)
+}
+
+/// Whether the shape can be had in one Data API call instead of five.
+///
+/// The five exist to break a circle. The shape query needs typed `NULL`s where
+/// the placeholders are; their types come from `PREPARE`; and a `PREPARE` only
+/// survives from one Data API call to the next inside a transaction, which
+/// then has to be opened and rolled back. A statement with no placeholders is
+/// not in that circle at all: there is nothing to substitute, so the shape
+/// query can be asked on its own and it answers with the column names and
+/// types together.
+///
+/// Four things have to hold, and the last two are about safety rather than
+/// arithmetic:
+///
+/// * **No `$n` placeholders.** Otherwise there is something to substitute, and
+///   the types to substitute with are what the other four calls are for.
+/// * **It only reads.** A write cannot be wrapped in a subquery, and wrapping
+///   it in a data-modifying CTE performs the write.
+/// * **It opens with a keyword a subquery can hold.** `SHOW`, `EXPLAIN` and
+///   the rest are rejected by the wrap -- and by `PREPARE` too, so nothing is
+///   lost by leaving them on the path that already handles them.
+/// * **The caller has no transaction open.** Inside one, a statement that does
+///   not compile aborts the whole transaction, which is exactly what the full
+///   probe's savepoint is there to prevent. Outside one, a shape query that
+///   fails costs nothing but itself.
+///
+/// Verified against Aurora PostgreSQL 17.9: run this way, outside any
+/// transaction, the wrap returns full column metadata -- names and types, for
+/// plain selects, catalogue tables, expression aliases, duplicate column names,
+/// CTEs and types the proxy maps to text -- and no rows.
+async fn one_call_is_enough(session: &Session, sql: &str) -> bool {
+    const WRAPPABLE: [&str; 4] = ["SELECT", "WITH", "VALUES", "TABLE"];
+
+    if sql::rewrite_placeholders(sql).param_count != 0 {
+        return false;
+    }
+    if sql::modifies_data(sql) {
+        return false;
+    }
+    if !sql::leading_words(sql, 1)
+        .first()
+        .is_some_and(|word| WRAPPABLE.contains(&word.as_str()))
+    {
+        return false;
+    }
+    session.transaction_id().await.is_none()
 }
 
 /// Work out a shape, and say whether the answer belongs to the schema.
@@ -158,7 +224,7 @@ async fn probe_inner(
         // wrapping it in a CTE to get around that performs the write.
         returning_fields(session, sql, &result_oids, tx).await?
     } else {
-        select_fields(session, sql, &param_types, tx).await?
+        select_fields(session, sql, &param_types, Some(tx)).await?
     };
 
     Ok(StatementShape {
@@ -235,14 +301,14 @@ async fn select_fields(
     session: &Session,
     sql: &str,
     param_types: &[Option<String>],
-    tx: &str,
+    tx: Option<&str>,
 ) -> Result<Vec<FieldInfo>, ErrorInfo> {
     let substituted = sql::substitute_null_params(sql, param_types);
     let outcome = session
         .execute_in(
             &format!("SELECT * FROM ({substituted}) AS dapi_shape WHERE false"),
             vec![],
-            Some(tx),
+            tx,
         )
         .await?;
     let Outcome::Rows { columns, .. } = outcome else {

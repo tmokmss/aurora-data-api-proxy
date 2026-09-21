@@ -137,10 +137,33 @@ Every statement is an HTTP round trip, so expect single-digit to low tens of
 milliseconds per query rather than the sub-millisecond of a local socket. Two
 things cost extra:
 
-- `Describe(statement)` runs a probe — `BEGIN`, `PREPARE`, a catalogue read, a
-  shape query, `ROLLBACK` — the first time the proxy sees a given statement.
-  That is five extra Data API calls, so the first use of a statement costs six
-  round trips where a direct caller pays one.
+- **Answering `Describe(statement)`.** The Data API has no operation for "what
+  shape is this statement", so the proxy asks PostgreSQL. What that costs
+  depends on the statement, and on nothing else:
+
+  | | extra Data API calls |
+  | --- | --- |
+  | A read with no `$n` placeholders | **1** |
+  | Anything with placeholders | **5** |
+  | A write (`INSERT`/`UPDATE`/`DELETE`) | 4, or 5 with `RETURNING *` |
+
+  With no placeholders the statement is wrapped as
+  `SELECT * FROM (<query>) WHERE false`. PostgreSQL plans that as a one-time
+  false filter and never runs the inner query, while the Data API still returns
+  the column names and types in full — one call, no transaction needed.
+
+  With placeholders that wrap needs typed `NULL`s where they are; the types
+  come from a `PREPARE`; and a `PREPARE` only survives from one Data API call
+  to the next inside a transaction. Hence `BEGIN`, `PREPARE`, a catalogue read,
+  the shape query, `ROLLBACK`. The same five are paid inside a caller's own
+  transaction, behind a savepoint, because a statement that does not compile
+  would otherwise abort it.
+
+  Not every client pays this. **Simple queries describe nothing**, and
+  `Describe(portal)` is answered by running the statement once and keeping the
+  result for the `Execute` that follows, so neither reaches the probe at all.
+  It is the clients that send `Describe(statement)` — tokio-postgres and pgx
+  above — that do.
 
   The answer is then kept, keyed by SQL text, and **shared between every
   connection in the process**. A statement's shape belongs to the schema rather
