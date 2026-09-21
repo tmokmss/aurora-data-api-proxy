@@ -11,6 +11,13 @@ jobs:
   conventional:
     name: conventional commit
     runs-on: ubuntu-22.04
+    # Dependabot is enabled from the repository settings rather than from a
+    # config file here, so its pull requests are titled "Bump x from a to b" --
+    # not a conventional commit, and not something that can be configured into
+    # one from this side. Exempt it, rather than leaving every dependency
+    # update unmergeable. The cost is that a dependency bump alone produces no
+    # release; a human commit is what ships it.
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
       # Squash-merging turns the pull request title into the commit message on
       # main, and that message is the only thing that decides whether a release
