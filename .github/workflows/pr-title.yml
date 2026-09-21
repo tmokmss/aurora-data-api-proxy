@@ -17,7 +17,7 @@ jobs:
       # happens and what it is numbered. A title semantic-release cannot parse
       # produces no release and no error, so the check belongs here, before the
       # merge, rather than being discovered by its silence afterwards.
-      - uses: amannn/action-semantic-pull-request@v5
+      - uses: amannn/action-semantic-pull-request@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

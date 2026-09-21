@@ -21,7 +21,7 @@ jobs:
     name: rustfmt + clippy
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -40,7 +40,7 @@ jobs:
         # x86_64-apple-darwin is cross-compiled from it at release time.
         os: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # This runs the unit tests only. The integration tests in
