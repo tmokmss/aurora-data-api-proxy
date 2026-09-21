@@ -1,0 +1,13 @@
+{
+  "name": "aurora-data-api-proxy-node-tests",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Checks that node-postgres works through the proxy.",
+  "type": "module",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
