@@ -17,8 +17,7 @@ tested and what does not work.
 
 Download a binary from the
 [latest release](https://github.com/tmokmss/aurora-data-api-proxy/releases/latest)
-— Linux and macOS, x86_64 and arm64 — or build from source with
-`cargo install --path .`.
+or build from source with `cargo install --path .`.
 
 ```console
 $ aurora-data-api-proxy \
