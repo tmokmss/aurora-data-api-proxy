@@ -1,6 +1,6 @@
 [package]
 name = "aurora-data-api-proxy"
-version = "0.1.0"
+version = "0.0.0-dev"
 edition = "2024"
 description = "Speak the PostgreSQL wire protocol to an Aurora cluster over the RDS Data API, so ordinary clients and drivers can reach it with IAM alone."
 license = "MIT"

@@ -1,0 +1,186 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Two runs racing for the same tag would be worse than a queue.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Both semantic-release runs below must agree on the version, so they share
+  # one pinned invocation. commit-analyzer, release-notes-generator and github
+  # ship with semantic-release itself; exec does not.
+  #
+  # The plugin list deliberately omits @semantic-release/git: that is the plugin
+  # that would push a "chore(release)" commit back to main, and the whole point
+  # of the setup below is that releases cost no commits.
+  SEMANTIC_RELEASE: >-
+    --yes
+    -p semantic-release@24
+    -p @semantic-release/exec@7
+    semantic-release
+
+jobs:
+  version:
+    name: decide version
+    runs-on: ubuntu-22.04
+    permissions:
+      # A dry run writes nothing, but @semantic-release/github still verifies up
+      # front that the token could push, so a read-only token fails the check.
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      version: ${{ steps.semantic.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # semantic-release reads every commit since the last tag, and the tags
+          # themselves. A shallow clone has neither.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # A dry run stops after verifyRelease, so nothing is tagged or published
+      # here -- but verifyRelease does run, which is how the exec plugin hands
+      # the chosen version back through $GITHUB_OUTPUT. When no commit since the
+      # last tag warrants a release, verifyRelease never runs, the output stays
+      # empty, and every job below skips itself.
+      - id: semantic
+        run: npx $SEMANTIC_RELEASE --dry-run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: test before release
+    needs: version
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # CI runs this too, but a release must not depend on branch protection
+      # having been configured to be the thing that keeps main green.
+      - run: cargo test --locked
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [version, test]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      # Three binaries out of four is worse than none: fail the whole release.
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Verified to cross-compile from the arm64 runner: the aws-lc-sys C
+          # and assembly sources build for x86_64 under Apple's universal SDK.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Cargo.toml carries a placeholder version in git, so that cutting a
+      # release never requires a commit. The real number exists only here, in
+      # the build that produces the binary, and reaches `--version` through
+      # clap's CARGO_PKG_VERSION.
+      - name: Stamp the version
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Dependency versions live inside inline tables, so a line-anchored
+          # match hits the package version and nothing else. Assert that.
+          matches=$(grep -c '^version = ' Cargo.toml)
+          if [ "$matches" -ne 1 ]; then
+            echo "expected exactly one package version line, found $matches" >&2
+            exit 1
+          fi
+          sed -i.bak "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+          rm Cargo.toml.bak
+          grep '^version = ' Cargo.toml
+
+      # No --locked here: the stamp above leaves Cargo.lock behind on purpose,
+      # and cargo refreshes it. The test job is what checks the lockfile.
+      - name: Build
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="aurora-data-api-proxy-v${VERSION}-${TARGET}"
+          mkdir -p "dist/${name}"
+          cp "target/${TARGET}/release/aurora-data-api-proxy" "dist/${name}/"
+          cp README.md COMPATIBILITY.md LICENSE "dist/${name}/"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          rm -rf "dist/${name}"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: tag and publish
+    needs: [version, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # The real run. It creates the tag, the release and the notes, and
+      # attaches the binaries built above, so a release is never visible for a
+      # window in which its downloads are missing.
+      - run: npx $SEMANTIC_RELEASE
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
