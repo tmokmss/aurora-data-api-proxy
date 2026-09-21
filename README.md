@@ -1,5 +1,8 @@
 # aurora-data-api-proxy
 
+[![CI](https://github.com/tmokmss/aurora-data-api-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/tmokmss/aurora-data-api-proxy/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/tmokmss/aurora-data-api-proxy)](https://github.com/tmokmss/aurora-data-api-proxy/releases/latest)
+
 Connect `psql`, a GUI client, or any PostgreSQL driver to an Aurora Serverless
 cluster over the RDS Data API — no bastion host, no VPN, no security-group
 holes. Just IAM.
@@ -34,9 +37,41 @@ so those clients work without knowing the Data API exists.
 
 ## Install
 
+### From a release
+
+Every release carries a binary for each of these, plus a `SHA256SUMS` file:
+
+| Platform | Asset suffix |
+| --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `x86_64-apple-darwin.tar.gz` |
+
+Asset names carry the version, so the easiest way to fetch the newest one is to
+let the GitHub CLI resolve it:
+
+```console
+$ gh release download --repo tmokmss/aurora-data-api-proxy \
+    --pattern '*-aarch64-apple-darwin.tar.gz'
+$ tar -xzf aurora-data-api-proxy-*.tar.gz
+```
+
+Otherwise pick a file from the
+[releases page](https://github.com/tmokmss/aurora-data-api-proxy/releases/latest).
+The Linux binaries are built on Ubuntu 22.04 and need glibc 2.35 or newer;
+build from source for anything older. Windows is not built, and has never been
+tested.
+
+### From source
+
 ```console
 cargo install --path .
 ```
+
+A source build reports its version as `0.0.0-dev`. That is not a mistake: the
+version number lives in the release tag rather than in the repository, and the
+release workflow stamps it into the binary.
 
 ## Configuration
 
@@ -153,6 +188,26 @@ They connect through real client libraries rather than calling the proxy's
 internals, because the differences between clients — which of them describes
 statements, which asks for binary, which sends `Describe(portal)` — are exactly
 what this proxy has to get right.
+
+## Releasing
+
+Releases are cut by [semantic-release](https://github.com/semantic-release/semantic-release)
+from the commit messages on `main`, so there is nothing to run by hand and no
+release commit is ever added to the history:
+
+| Commit message | Effect |
+| --- | --- |
+| `fix: ...`, `perf: ...` | patch release |
+| `feat: ...` | minor release |
+| `feat!: ...` or a `BREAKING CHANGE:` footer | major release |
+| anything else (`docs:`, `ci:`, `chore:`, ...) | no release |
+
+Pull requests are squash-merged, so the **pull request title** becomes that
+commit message; a CI check rejects titles that are not conventional commits,
+because an unparseable one would produce no release and no error.
+
+The consequence of keeping the history free of release commits is that there is
+no `CHANGELOG.md` in the tree. The generated notes live on each release instead.
 
 ## License
 
