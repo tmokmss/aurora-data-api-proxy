@@ -5,9 +5,14 @@ on:
     branches: [main]
   pull_request:
 
-# A superseded run has nothing left to tell us.
+# A superseded pull request run has nothing left to tell us, so a new push to a
+# branch cancels the run still going for the old head. A merge to main is not
+# superseded by the next merge, though: each commit on main is a state the
+# branch actually passed through and wants its own verdict, and github.ref is
+# refs/heads/main for all of them. Key the group on the commit there instead,
+# so consecutive merges queue for nothing and cancel nothing.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 permissions:
