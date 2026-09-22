@@ -133,12 +133,25 @@ twice.
 
 ## Performance
 
-Every statement is an HTTP round trip, so expect single-digit to low tens of
-milliseconds per query rather than the sub-millisecond of a local socket. Two
-things cost extra:
+Every statement is an HTTP round trip rather than the sub-millisecond of a local
+socket, and that round trip is nearly the whole cost: the proxy's own
+translation does not show up next to it.
+
+A query whose statement the connection has already seen costs the same as
+issuing it to the Data API yourself, to within a millisecond either way, and
+returning a thousand rows costs no more than returning one.
+[docs/benchmark.md](docs/benchmark.md) has the method, the numbers and what they
+do not cover.
+
+Two things cost extra, and only one of them is large:
 
 - `Describe(statement)` runs a probe — `BEGIN`, `PREPARE`, a catalogue read, a
   shape query, `ROLLBACK` — the first time a connection sees a given statement.
-  The result is cached per connection by SQL text, so repeated use is free.
+  That is five extra Data API calls: the first use of a statement costs six
+  round trips where a direct caller pays one. The shape is then cached per
+  connection by SQL text, so every later use of that text is free. The cache
+  dies with the connection, so a pool that opens a connection per request
+  re-probes everything; a long-lived connection pays once. Simple queries never
+  probe, because nothing asks the proxy to describe anything.
 - A scaled-to-zero cluster takes 10–30 seconds to wake. The proxy retries
   `DatabaseResumingException` with backoff for `--resume-timeout-secs`.
