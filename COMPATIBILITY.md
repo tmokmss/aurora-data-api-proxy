@@ -145,13 +145,60 @@ do not cover.
 
 Two things cost extra, and only one of them is large:
 
-- `Describe(statement)` runs a probe — `BEGIN`, `PREPARE`, a catalogue read, a
-  shape query, `ROLLBACK` — the first time a connection sees a given statement.
-  That is five extra Data API calls: the first use of a statement costs six
-  round trips where a direct caller pays one. The shape is then cached per
-  connection by SQL text, so every later use of that text is free. The cache
-  dies with the connection, so a pool that opens a connection per request
-  re-probes everything; a long-lived connection pays once. Simple queries never
-  probe, because nothing asks the proxy to describe anything.
+- **Answering `Describe(statement)`.** The Data API has no operation for "what
+  shape is this statement", so the proxy asks PostgreSQL. What that costs
+  depends on the statement, and on nothing else:
+
+  | | extra Data API calls |
+  | --- | --- |
+  | A read with no `$n` placeholders | **1** |
+  | Anything with placeholders | **5** |
+  | A write (`INSERT`/`UPDATE`/`DELETE`) | 4, or 5 with `RETURNING *` |
+
+  With no placeholders the statement is wrapped as
+  `SELECT * FROM (<query>) WHERE false`. PostgreSQL plans that as a one-time
+  false filter and never runs the inner query, while the Data API still returns
+  the column names and types in full — one call, no transaction needed.
+
+  With placeholders that wrap needs typed `NULL`s where they are; the types
+  come from a `PREPARE`; and a `PREPARE` only survives from one Data API call
+  to the next inside a transaction. Hence `BEGIN`, `PREPARE`, a catalogue read,
+  the shape query, `ROLLBACK`. The same five are paid inside a caller's own
+  transaction, behind a savepoint, because a statement that does not compile
+  would otherwise abort it.
+
+  Not every client pays this. **Simple queries describe nothing**, and
+  `Describe(portal)` is answered by running the statement once and keeping the
+  result for the `Execute` that follows, so neither reaches the probe at all.
+  It is the clients that send `Describe(statement)` — tokio-postgres and pgx
+  above — that do.
+
+  The answer is then kept, keyed by SQL text, and **shared between every
+  connection in the process**. A statement's shape belongs to the schema rather
+  than to whoever asked, so a pool that opens a connection per request — or a
+  Lambda whose handler reconnects — pays for a statement once rather than once
+  per request. Simple queries never probe at all.
+
+  Two things are deliberately excluded from the sharing. A probe that had to
+  run inside the caller's own transaction is kept to that connection, because a
+  `SET LOCAL`, a temporary table or uncommitted DDL are visible only there. And
+  any statement beginning `CREATE`, `ALTER`, `DROP`, `REINDEX` or `REFRESH`
+  empties the cache as it goes past, because a column added or retyped
+  underneath a remembered shape would leave a client decoding rows against a
+  description that no longer matches them.
+
+  What the proxy cannot see is DDL that reaches the cluster by another route:
+  a migration run from elsewhere while this proxy is up leaves it describing
+  statements from a stale cache. `--describe-cache connection` narrows that
+  window to a single connection's lifetime, at the cost of probing again on
+  every new connection.
+
+  The store holds a few thousand statements and drops the least recently used
+  to make room. That matters for a client that writes its values into the SQL
+  rather than binding them: `where id = 41` and `where id = 42` are two
+  statements as far as any cache is concerned — PostgreSQL's own included —
+  so such a client fills the store with entries it will never ask for again.
+  Dropping the coldest means it costs those clients their own performance and
+  not everybody else's.
 - A scaled-to-zero cluster takes 10–30 seconds to wake. The proxy retries
   `DatabaseResumingException` with backoff for `--resume-timeout-secs`.

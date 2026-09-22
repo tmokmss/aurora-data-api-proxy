@@ -3,8 +3,15 @@
 //! `Describe(statement)` arrives before `Bind`, so the proxy has to answer it
 //! with no parameter values in hand: the parameter types, and the result
 //! columns, of a statement that has never been executed. The Data API offers
-//! nothing for this, so the proxy asks PostgreSQL directly, through the one
-//! stateful thing the Data API does have -- a transaction.
+//! nothing for this, so the proxy asks PostgreSQL directly.
+//!
+//! A statement with no placeholders is asked in one call. Wrapped as
+//! `SELECT * FROM (<query>) WHERE false`, it comes back with the column names
+//! and types and no rows, and nothing about it needs a session to be held open
+//! from one call to the next. That is the common case and it is the cheap one.
+//!
+//! Everything else goes the long way round, through the one stateful thing the
+//! Data API does have -- a transaction.
 //!
 //! Inside a transaction the Data API pins one backend session, which means a
 //! `PREPARE` in one call is still there for the next. That gives
@@ -72,14 +79,84 @@ pub async fn describe_statement(
         return Ok(cached);
     }
 
-    let shape = Arc::new(run_probe(session, sql).await?);
-    session.cache_shape(sql.to_string(), shape.clone()).await;
+    let (shape, shareable) = if one_call_is_enough(session, sql).await {
+        let fields = select_fields(session, sql, &[], None).await?;
+        (
+            StatementShape {
+                param_types: Vec::new(),
+                fields,
+            },
+            true,
+        )
+    } else {
+        run_probe(session, sql).await?
+    };
+
+    let shape = Arc::new(shape);
+    session
+        .cache_shape(sql.to_string(), shape.clone(), shareable)
+        .await;
     Ok(shape)
 }
 
-async fn run_probe(session: &Session, sql: &str) -> Result<StatementShape, ErrorInfo> {
+/// Whether the shape can be had in one Data API call instead of five.
+///
+/// The five exist to break a circle. The shape query needs typed `NULL`s where
+/// the placeholders are; their types come from `PREPARE`; and a `PREPARE` only
+/// survives from one Data API call to the next inside a transaction, which
+/// then has to be opened and rolled back. A statement with no placeholders is
+/// not in that circle at all: there is nothing to substitute, so the shape
+/// query can be asked on its own and it answers with the column names and
+/// types together.
+///
+/// Four things have to hold, and the last two are about safety rather than
+/// arithmetic:
+///
+/// * **No `$n` placeholders.** Otherwise there is something to substitute, and
+///   the types to substitute with are what the other four calls are for.
+/// * **It only reads.** A write cannot be wrapped in a subquery, and wrapping
+///   it in a data-modifying CTE performs the write.
+/// * **It opens with a keyword a subquery can hold.** `SHOW`, `EXPLAIN` and
+///   the rest are rejected by the wrap -- and by `PREPARE` too, so nothing is
+///   lost by leaving them on the path that already handles them.
+/// * **The caller has no transaction open.** Inside one, a statement that does
+///   not compile aborts the whole transaction, which is exactly what the full
+///   probe's savepoint is there to prevent. Outside one, a shape query that
+///   fails costs nothing but itself.
+///
+/// Verified against Aurora PostgreSQL 17.9: run this way, outside any
+/// transaction, the wrap returns full column metadata -- names and types, for
+/// plain selects, catalogue tables, expression aliases, duplicate column names,
+/// CTEs and types the proxy maps to text -- and no rows.
+async fn one_call_is_enough(session: &Session, sql: &str) -> bool {
+    shape_query_stands_alone(sql) && session.transaction_id().await.is_none()
+}
+
+/// The part of [`one_call_is_enough`] that depends only on the statement.
+///
+/// Split out so that the three conditions on the text can be checked without a
+/// cluster, and so checked wherever the tests run rather than only where one
+/// is configured.
+fn shape_query_stands_alone(sql: &str) -> bool {
+    const WRAPPABLE: [&str; 4] = ["SELECT", "WITH", "VALUES", "TABLE"];
+
+    sql::rewrite_placeholders(sql).param_count == 0
+        && !sql::modifies_data(sql)
+        && sql::leading_words(sql, 1)
+            .first()
+            .is_some_and(|word| WRAPPABLE.contains(&word.as_str()))
+}
+
+/// Work out a shape, and say whether the answer belongs to the schema.
+///
+/// A probe that opened its own transaction saw the database the way every
+/// connection sees it. A probe that borrowed the caller's transaction did not:
+/// a `SET LOCAL`, a temporary table or DDL the caller has not committed are all
+/// visible inside it and to nobody else, so its answer cannot be lent out.
+async fn run_probe(session: &Session, sql: &str) -> Result<(StatementShape, bool), ErrorInfo> {
     let suffix = unique_suffix();
     let (tx, cleanup) = begin_probe(session, &suffix).await?;
+    let shareable = matches!(cleanup, Cleanup::OwnedTransaction);
 
     let result = probe_inner(session, sql, &suffix, &tx).await;
 
@@ -87,7 +164,7 @@ async fn run_probe(session: &Session, sql: &str) -> Result<StatementShape, Error
     if let Err(e) = end_probe(session, &tx, cleanup).await {
         tracing::warn!("could not clean up after a describe probe: {}", e.message);
     }
-    result
+    result.map(|shape| (shape, shareable))
 }
 
 /// Get a transaction to probe in, without endangering the caller's.
@@ -148,7 +225,7 @@ async fn probe_inner(
         // wrapping it in a CTE to get around that performs the write.
         returning_fields(session, sql, &result_oids, tx).await?
     } else {
-        select_fields(session, sql, &param_types, tx).await?
+        select_fields(session, sql, &param_types, Some(tx)).await?
     };
 
     Ok(StatementShape {
@@ -225,14 +302,14 @@ async fn select_fields(
     session: &Session,
     sql: &str,
     param_types: &[Option<String>],
-    tx: &str,
+    tx: Option<&str>,
 ) -> Result<Vec<FieldInfo>, ErrorInfo> {
     let substituted = sql::substitute_null_params(sql, param_types);
     let outcome = session
         .execute_in(
             &format!("SELECT * FROM ({substituted}) AS dapi_shape WHERE false"),
             vec![],
-            Some(tx),
+            tx,
         )
         .await?;
     let Outcome::Rows { columns, .. } = outcome else {
@@ -408,5 +485,91 @@ mod tests {
         let a = unique_suffix();
         let b = unique_suffix();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn one_call_answers_a_read_with_no_placeholders() {
+        assert!(shape_query_stands_alone("SELECT 1"));
+        assert!(shape_query_stands_alone("select a, b from t where c = 'x'"));
+        assert!(shape_query_stands_alone(
+            "WITH x AS (SELECT 1) SELECT * FROM x"
+        ));
+        assert!(shape_query_stands_alone("VALUES (1, 'a')"));
+        assert!(shape_query_stands_alone("TABLE t"));
+        assert!(shape_query_stands_alone("  -- a comment\n  SELECT 1"));
+        // A literal that looks like a placeholder is not one.
+        assert!(shape_query_stands_alone("SELECT '$1'"));
+    }
+
+    #[test]
+    fn a_placeholder_forces_the_long_way() {
+        // The wrap needs a typed NULL here, and the type comes from PREPARE.
+        assert!(!shape_query_stands_alone("SELECT $1"));
+        assert!(!shape_query_stands_alone("select * from t where a = $1"));
+        assert!(!shape_query_stands_alone("select $2, $1"));
+    }
+
+    #[test]
+    fn a_write_forces_the_long_way() {
+        // A write cannot be wrapped in a subquery, and wrapping it in a
+        // data-modifying CTE performs the write.
+        assert!(!shape_query_stands_alone("INSERT INTO t VALUES (1)"));
+        assert!(!shape_query_stands_alone("UPDATE t SET a = 1"));
+        assert!(!shape_query_stands_alone("DELETE FROM t"));
+        assert!(!shape_query_stands_alone(
+            "WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x"
+        ));
+        // `FOR UPDATE` takes locks, so the wrap is not free of consequences.
+        assert!(!shape_query_stands_alone("select * from t for update"));
+    }
+
+    #[test]
+    fn a_statement_a_subquery_cannot_hold_forces_the_long_way() {
+        assert!(!shape_query_stands_alone("SHOW server_version"));
+        assert!(!shape_query_stands_alone("EXPLAIN SELECT 1"));
+        assert!(!shape_query_stands_alone("SET search_path = public"));
+        assert!(!shape_query_stands_alone("CREATE TABLE t (a int)"));
+        assert!(!shape_query_stands_alone("BEGIN"));
+        assert!(!shape_query_stands_alone(""));
+    }
+
+    /// Inside a transaction the short way is refused whatever the statement is.
+    ///
+    /// A statement that does not compile aborts a PostgreSQL transaction, and
+    /// describing a statement that does not compile is an ordinary thing for a
+    /// client to do. The long way runs behind a savepoint for that reason; the
+    /// short way has no savepoint to hide behind.
+    #[tokio::test]
+    async fn an_open_transaction_refuses_the_short_way() {
+        let session = offline_session();
+        assert!(
+            one_call_is_enough(&session, "SELECT 1").await,
+            "with no transaction open there is nothing to protect"
+        );
+
+        session.adopt_transaction("tx-1".to_string()).await;
+        assert!(
+            !one_call_is_enough(&session, "SELECT 1").await,
+            "the caller's transaction must not be put at risk to save four calls"
+        );
+    }
+
+    /// A session with no credentials and nothing to talk to.
+    fn offline_session() -> Session {
+        use crate::dataapi::DataApi;
+        use crate::session::SharedShapes;
+
+        let conf = aws_sdk_rdsdata::Config::builder()
+            .behavior_version(aws_sdk_rdsdata::config::BehaviorVersion::latest())
+            .region(aws_sdk_rdsdata::config::Region::new("us-east-1"))
+            .build();
+        let api = DataApi::new(
+            aws_sdk_rdsdata::Client::from_conf(conf),
+            "arn:aws:rds:us-east-1:1:cluster:c".into(),
+            "arn:aws:secretsmanager:us-east-1:1:secret:s".into(),
+            "postgres".into(),
+            std::time::Duration::from_secs(1),
+        );
+        Session::new(api, Arc::new(SharedShapes::shared()))
     }
 }

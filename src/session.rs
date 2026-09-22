@@ -42,6 +42,165 @@ struct Pending {
     tag: Tag,
 }
 
+/// How many shapes one connection keeps to itself.
+///
+/// Since the process-wide store took over everything a connection can share,
+/// this holds only what a probe learned inside the caller's own transaction --
+/// uncommon, and gone when the connection is.
+const SESSION_SHAPE_LIMIT: usize = 512;
+
+/// How many shapes the process keeps between connections.
+///
+/// Larger than one connection's, because it stands in for all of them. A shape
+/// is a list of column names and types, so a few thousand of them is single
+/// figures of megabytes at worst -- a good trade against a Data API call.
+const SHARED_SHAPE_LIMIT: usize = 4096;
+
+/// A bounded map of statement shapes that drops the least recently used.
+///
+/// The first version emptied itself when it filled. That was tolerable while
+/// every connection had its own, and became a poor trade once one store served
+/// the whole process: a flood of cheap shapes -- which is what a client that
+/// inlines its literals produces, a new statement text per value -- would
+/// throw out the expensive five-call ones that every connection was relying
+/// on. Dropping the coldest entry loses one answer; emptying loses all of them.
+///
+/// Eviction is a linear scan for the oldest. That is not clever and does not
+/// need to be: it happens only on a miss, which has already spent between one
+/// and five HTTP round trips, so walking a few thousand integers does not
+/// show up beside it.
+#[derive(Debug)]
+struct ShapeCache {
+    entries: HashMap<String, Cached>,
+    limit: usize,
+    /// Ticks on every use, so the lowest tick is the least recently used.
+    clock: u64,
+}
+
+#[derive(Debug)]
+struct Cached {
+    shape: Arc<StatementShape>,
+    used: u64,
+}
+
+impl ShapeCache {
+    fn new(limit: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            limit,
+            clock: 0,
+        }
+    }
+
+    /// Look a shape up, and count that as having used it.
+    fn get(&mut self, sql: &str) -> Option<Arc<StatementShape>> {
+        self.clock += 1;
+        let now = self.clock;
+        let entry = self.entries.get_mut(sql)?;
+        entry.used = now;
+        Some(entry.shape.clone())
+    }
+
+    fn insert(&mut self, sql: String, shape: Arc<StatementShape>) {
+        self.clock += 1;
+        // Replacing an entry frees no room, so only a new key can need any.
+        if self.entries.len() >= self.limit && !self.entries.contains_key(&sql) {
+            self.evict_coldest();
+        }
+        self.entries.insert(
+            sql,
+            Cached {
+                shape,
+                used: self.clock,
+            },
+        );
+    }
+
+    fn evict_coldest(&mut self) {
+        let coldest = self
+            .entries
+            .iter()
+            .min_by_key(|(_, cached)| cached.used)
+            .map(|(sql, _)| sql.clone());
+        if let Some(sql) = coldest {
+            self.entries.remove(&sql);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Statement shapes every connection in this process can use.
+///
+/// A shape is a property of the schema rather than of a connection, so the
+/// five Data API calls that work one out need not be paid again by the next
+/// connection to ask. That matters most where connections are short: a pool
+/// that opens one per request, or a Lambda whose handler reconnects, otherwise
+/// probes every statement every time.
+///
+/// It is deliberately empty when constructed and deliberately easy to clear.
+/// See [`Session::forget_shapes`] for when it is.
+#[derive(Debug)]
+pub struct SharedShapes {
+    entries: Mutex<ShapeCache>,
+    /// Off means every `insert` is dropped on the floor, which is what
+    /// `--describe-cache connection` asks for.
+    shared: bool,
+}
+
+impl SharedShapes {
+    /// A store, sharing or not.
+    pub fn new(shared: bool) -> Self {
+        Self {
+            entries: Mutex::new(ShapeCache::new(SHARED_SHAPE_LIMIT)),
+            shared,
+        }
+    }
+
+    /// A store that connections share.
+    pub fn shared() -> Self {
+        Self::new(true)
+    }
+
+    /// A store that never holds anything, leaving each connection its own.
+    pub fn disabled() -> Self {
+        Self::new(false)
+    }
+
+    async fn get(&self, sql: &str) -> Option<Arc<StatementShape>> {
+        if !self.shared {
+            return None;
+        }
+        self.entries.lock().await.get(sql)
+    }
+
+    async fn insert(&self, sql: String, shape: Arc<StatementShape>) {
+        if !self.shared {
+            return;
+        }
+        self.entries.lock().await.insert(sql, shape);
+    }
+
+    async fn clear(&self) {
+        self.entries.lock().await.clear();
+    }
+
+    /// How many shapes are held. For tests.
+    pub async fn len(&self) -> usize {
+        self.entries.lock().await.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+}
+
 /// Everything one client connection remembers.
 pub struct Session {
     api: DataApi,
@@ -49,7 +208,10 @@ pub struct Session {
     /// True once a statement has failed inside the open transaction. PostgreSQL
     /// rejects everything but a rollback in that state, and so must we.
     failed: Mutex<bool>,
-    describe_cache: Mutex<HashMap<String, Arc<StatementShape>>>,
+    describe_cache: Mutex<ShapeCache>,
+    /// Shapes this connection may take from and add to, shared with the rest
+    /// of the process.
+    shapes: Arc<SharedShapes>,
     pending: Mutex<HashMap<usize, Pending>>,
 }
 
@@ -60,12 +222,13 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
-    pub fn new(api: DataApi) -> Self {
+    pub fn new(api: DataApi, shapes: Arc<SharedShapes>) -> Self {
         Self {
             api,
             transaction: Mutex::new(None),
             failed: Mutex::new(false),
-            describe_cache: Mutex::new(HashMap::new()),
+            describe_cache: Mutex::new(ShapeCache::new(SESSION_SHAPE_LIMIT)),
+            shapes,
             pending: Mutex::new(HashMap::new()),
         }
     }
@@ -161,17 +324,36 @@ impl Session {
     // -- the statement shape cache ------------------------------------------
 
     pub async fn cached_shape(&self, sql: &str) -> Option<Arc<StatementShape>> {
-        self.describe_cache.lock().await.get(sql).cloned()
+        if let Some(shape) = self.describe_cache.lock().await.get(sql) {
+            return Some(shape);
+        }
+        self.shapes.get(sql).await
     }
 
-    pub async fn cache_shape(&self, sql: String, shape: Arc<StatementShape>) {
-        // A connection that prepares an unbounded number of distinct
-        // statements should not grow this without limit.
-        let mut cache = self.describe_cache.lock().await;
-        if cache.len() >= 512 {
-            cache.clear();
+    /// Remember what a probe worked out.
+    ///
+    /// `shareable` says whether the answer belongs to the schema or only to
+    /// this connection. A probe that ran inside the caller's own transaction
+    /// could have seen a `SET LOCAL search_path`, a temporary table or
+    /// uncommitted DDL, none of which another connection can see, so those
+    /// answers stay here. A probe that opened its own transaction saw the
+    /// database as everyone else sees it, and is worth sharing.
+    pub async fn cache_shape(&self, sql: String, shape: Arc<StatementShape>, shareable: bool) {
+        if shareable {
+            self.shapes.insert(sql.clone(), shape.clone()).await;
         }
-        cache.insert(sql, shape);
+        self.describe_cache.lock().await.insert(sql, shape);
+    }
+
+    /// Throw away every remembered shape, here and process-wide.
+    ///
+    /// Called when a statement goes through that could have changed what a
+    /// shape would be. It is cheap -- the next `Describe` of each statement
+    /// probes again -- and the alternative is describing a statement to a
+    /// client in terms that no longer match what it will receive.
+    pub async fn forget_shapes(&self) {
+        self.describe_cache.lock().await.clear();
+        self.shapes.clear().await;
     }
 
     // -- results held between Describe and Execute --------------------------
@@ -239,5 +421,218 @@ mod tests {
         };
         assert_eq!(shape.param_types.len(), 2);
         assert!(shape.fields.is_empty(), "no fields means no rows");
+    }
+
+    fn shape(name: &str) -> Arc<StatementShape> {
+        Arc::new(StatementShape {
+            param_types: vec![Some(name.to_string())],
+            fields: vec![],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_shared_store_hands_one_connections_answer_to_the_next() {
+        let shapes = SharedShapes::shared();
+        shapes.insert("select 1".into(), shape("int4")).await;
+
+        let found = shapes.get("select 1").await.expect("the shape");
+        assert_eq!(found.param_types, vec![Some("int4".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_store_keeps_nothing() {
+        let shapes = SharedShapes::disabled();
+        shapes.insert("select 1".into(), shape("int4")).await;
+
+        assert!(
+            shapes.get("select 1").await.is_none(),
+            "--describe-cache connection must not share across connections"
+        );
+        assert!(shapes.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn a_shared_store_stays_within_its_limit() {
+        let shapes = SharedShapes::shared();
+        for i in 0..=SHARED_SHAPE_LIMIT {
+            shapes.insert(format!("select {i}"), shape("int4")).await;
+        }
+        assert_eq!(
+            shapes.len().await,
+            SHARED_SHAPE_LIMIT,
+            "a process that sees unbounded distinct SQL should hold the limit, \
+             neither growing past it nor emptying itself to get back under it"
+        );
+    }
+
+    #[test]
+    fn a_full_cache_drops_the_coldest_rather_than_everything() {
+        let mut cache = ShapeCache::new(3);
+        for sql in ["a", "b", "c", "d"] {
+            cache.insert(sql.into(), shape(sql));
+        }
+
+        assert_eq!(cache.len(), 3);
+        assert!(
+            cache.get("a").is_none(),
+            "the coldest entry is the one to go"
+        );
+        for kept in ["b", "c", "d"] {
+            assert!(cache.get(kept).is_some(), "{kept} should have survived");
+        }
+    }
+
+    /// Why this is an LRU and not a "start again when full".
+    ///
+    /// A client that inlines its literals produces a new statement text per
+    /// value, each costing one Data API call to describe. Emptying the cache to
+    /// make room for those threw out the statements that had cost five calls
+    /// each and that every connection in the process was relying on.
+    #[test]
+    fn a_flood_of_cheap_shapes_does_not_wash_out_one_in_use() {
+        const IN_USE: &str = "select * from orders where id = $1";
+
+        let mut cache = ShapeCache::new(8);
+        cache.insert(IN_USE.into(), shape("cost five calls"));
+
+        for i in 0..200 {
+            cache.insert(
+                format!("select * from orders where id = {i}"),
+                shape("cheap"),
+            );
+            assert!(
+                cache.get(IN_USE).is_some(),
+                "the statement still in use was evicted after {i} cheap inserts"
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_a_shape_evicts_nothing() {
+        let mut cache = ShapeCache::new(2);
+        cache.insert("a".into(), shape("first"));
+        cache.insert("b".into(), shape("b"));
+        cache.insert("a".into(), shape("second"));
+
+        assert_eq!(cache.len(), 2);
+        assert!(
+            cache.get("b").is_some(),
+            "a key that is already there needs no room made for it"
+        );
+        assert_eq!(
+            cache.get("a").expect("a").param_types,
+            vec![Some("second".to_string())],
+            "and the newer answer wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_leaves_nothing_behind() {
+        let shapes = SharedShapes::shared();
+        shapes.insert("select 1".into(), shape("int4")).await;
+        shapes.clear().await;
+        assert!(shapes.get("select 1").await.is_none());
+    }
+
+    /// A session with no credentials and nothing to talk to.
+    ///
+    /// Building the SDK client does no I/O, so the parts of a session that are
+    /// only bookkeeping -- which store an answer goes into, and which one it
+    /// comes back out of -- can be decided without a cluster, and therefore
+    /// checked in CI rather than only on a machine that has one.
+    fn offline_session(shapes: Arc<SharedShapes>) -> Session {
+        let conf = aws_sdk_rdsdata::Config::builder()
+            .behavior_version(aws_sdk_rdsdata::config::BehaviorVersion::latest())
+            .region(aws_sdk_rdsdata::config::Region::new("us-east-1"))
+            .build();
+        let api = DataApi::new(
+            aws_sdk_rdsdata::Client::from_conf(conf),
+            "arn:aws:rds:us-east-1:1:cluster:c".into(),
+            "arn:aws:secretsmanager:us-east-1:1:secret:s".into(),
+            "postgres".into(),
+            std::time::Duration::from_secs(1),
+        );
+        Session::new(api, shapes)
+    }
+
+    #[tokio::test]
+    async fn a_shareable_answer_reaches_the_next_connection() {
+        let shapes = Arc::new(SharedShapes::shared());
+        let first = offline_session(shapes.clone());
+        let second = offline_session(shapes.clone());
+
+        first
+            .cache_shape("select 1".into(), shape("int4"), true)
+            .await;
+
+        let found = second.cached_shape("select 1").await.expect("the shape");
+        assert_eq!(found.param_types, vec![Some("int4".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_learned_inside_a_transaction_is_not_lent_out() {
+        let shapes = Arc::new(SharedShapes::shared());
+        let first = offline_session(shapes.clone());
+        let second = offline_session(shapes.clone());
+
+        first
+            .cache_shape("select 1".into(), shape("int4"), false)
+            .await;
+
+        assert!(
+            first.cached_shape("select 1").await.is_some(),
+            "the connection that worked it out should still have it"
+        );
+        assert!(
+            second.cached_shape("select 1").await.is_none(),
+            "a SET LOCAL, a temporary table or uncommitted DDL are visible only \
+             inside the transaction that made them, so an answer learned there \
+             cannot be handed to another connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_prefers_its_own_answer_to_the_shared_one() {
+        let shapes = Arc::new(SharedShapes::shared());
+        let session = offline_session(shapes.clone());
+
+        shapes
+            .insert("select 1".into(), shape("from the store"))
+            .await;
+        session
+            .cache_shape("select 1".into(), shape("its own"), false)
+            .await;
+
+        let found = session.cached_shape("select 1").await.expect("the shape");
+        assert_eq!(
+            found.param_types,
+            vec![Some("its own".to_string())],
+            "what this connection worked out in its own transaction is the more \
+             specific answer, and has to win"
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_empties_the_connection_and_the_process() {
+        let shapes = Arc::new(SharedShapes::shared());
+        let session = offline_session(shapes.clone());
+        let other = offline_session(shapes.clone());
+
+        session
+            .cache_shape("shared".into(), shape("int4"), true)
+            .await;
+        session
+            .cache_shape("private".into(), shape("int4"), false)
+            .await;
+
+        session.forget_shapes().await;
+
+        assert!(session.cached_shape("shared").await.is_none());
+        assert!(session.cached_shape("private").await.is_none());
+        assert!(
+            other.cached_shape("shared").await.is_none(),
+            "DDL changes the schema for everyone, so it has to invalidate for everyone"
+        );
+        assert!(shapes.is_empty().await);
     }
 }

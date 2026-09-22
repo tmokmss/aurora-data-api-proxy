@@ -4,11 +4,16 @@
 //! unless `CLUSTER_ARN`, `SECRET_ARN` and `DATABASE` are all set. Everything
 //! that can be checked without a cluster is a unit test instead.
 
+// Each test binary compiles this module separately and uses the part of it it
+// needs, so anything another binary uses looks dead from here.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use aurora_data_api_proxy::dataapi::DataApi;
 use aurora_data_api_proxy::handlers::ProxyFactory;
+use aurora_data_api_proxy::session::SharedShapes;
 use tokio::net::TcpListener;
 
 /// The cluster settings, or `None` when the tests should be skipped.
@@ -51,6 +56,15 @@ macro_rules! require_cluster {
 /// exercises the same code path a real client would without needing the binary
 /// on disk.
 pub async fn start_proxy(target: &Target) -> String {
+    start_proxy_with_shapes(target, Arc::new(SharedShapes::shared())).await
+}
+
+/// Start a proxy over a shape store the test holds a handle to.
+///
+/// That handle is how a test can see whether a connection probed or took
+/// somebody else's answer, which is otherwise only visible as a difference in
+/// how many Data API calls went out.
+pub async fn start_proxy_with_shapes(target: &Target, shapes: Arc<SharedShapes>) -> String {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Ok(region) = std::env::var("AWS_REGION") {
         loader = loader.region(aws_config::Region::new(region));
@@ -72,7 +86,7 @@ pub async fn start_proxy(target: &Target) -> String {
         .expect("bind an ephemeral port");
     let port = listener.local_addr().expect("local address").port();
 
-    let factory = Arc::new(ProxyFactory::new(api, "17.0".to_string()));
+    let factory = Arc::new(ProxyFactory::with_shapes(api, "17.0".to_string(), shapes));
     tokio::spawn(async move {
         loop {
             let Ok((socket, _)) = listener.accept().await else {
@@ -94,7 +108,12 @@ pub async fn start_proxy(target: &Target) -> String {
 /// Connect a `tokio_postgres` client to a freshly started proxy.
 pub async fn connect(target: &Target) -> tokio_postgres::Client {
     let conn_str = start_proxy(target).await;
-    let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+    connect_to(&conn_str).await
+}
+
+/// Open one more connection to a proxy that is already running.
+pub async fn connect_to(conn_str: &str) -> tokio_postgres::Client {
+    let (client, connection) = tokio_postgres::connect(conn_str, tokio_postgres::NoTls)
         .await
         .expect("connect to the proxy");
     tokio::spawn(async move {

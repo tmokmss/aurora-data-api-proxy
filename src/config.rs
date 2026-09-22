@@ -1,6 +1,28 @@
 //! Command line and environment configuration.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// How widely the proxy reuses what it has worked out about a statement.
+///
+/// Answering `Describe` costs five Data API calls, and the answer is a
+/// property of the schema rather than of the connection that asked.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescribeCache {
+    /// Share between every connection in this process.
+    Process,
+    /// Keep each connection's own, as if no other connection existed.
+    Connection,
+}
+
+impl DescribeCache {
+    /// Whether connections may use what another connection worked out.
+    ///
+    /// This is the whole of what the setting does, so it is the whole of what
+    /// there is to get wrong.
+    pub fn shares(self) -> bool {
+        matches!(self, DescribeCache::Process)
+    }
+}
 
 /// Speak the PostgreSQL wire protocol on a local socket and forward queries to
 /// an Aurora cluster over the RDS Data API.
@@ -39,6 +61,21 @@ pub struct Config {
     /// Log level: error, warn, info, debug or trace.
     #[arg(long, env = "LOG_LEVEL", default_value = "info")]
     pub log_level: String,
+
+    /// How widely to reuse what the proxy learns about a statement's shape.
+    ///
+    /// Answering a client's `Describe` costs five Data API calls, and the
+    /// answer belongs to the schema rather than to the connection that asked,
+    /// so by default every connection in this process can use it. That is what
+    /// keeps a pool that opens a connection per request, or a Lambda whose
+    /// handler reconnects, from probing the same statement over and over.
+    ///
+    /// The proxy empties the cache when it sees DDL go past. It cannot see DDL
+    /// run by anything else, so if migrations reach the cluster by another
+    /// route while this proxy is running, `connection` narrows the window to
+    /// one connection's lifetime.
+    #[arg(long, env = "DESCRIBE_CACHE", value_enum, default_value_t = DescribeCache::Process)]
+    pub describe_cache: DescribeCache,
 }
 
 impl Config {
@@ -81,6 +118,7 @@ mod tests {
             region: None,
             resume_timeout_secs: 90,
             log_level: "info".into(),
+            describe_cache: DescribeCache::Process,
         }
     }
 
@@ -89,6 +127,12 @@ mod tests {
         assert!(config("127.0.0.1:5432").listens_on_loopback());
         assert!(config("[::1]:5432").listens_on_loopback());
         assert!(config("localhost:5432").listens_on_loopback());
+    }
+
+    #[test]
+    fn the_describe_cache_setting_means_what_it_says() {
+        assert!(DescribeCache::Process.shares());
+        assert!(!DescribeCache::Connection.shares());
     }
 
     #[test]

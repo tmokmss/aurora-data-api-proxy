@@ -414,6 +414,26 @@ pub fn leading_words(sql: &str, max: usize) -> Vec<String> {
     words
 }
 
+/// Whether the statement could change what another statement's shape is.
+///
+/// The proxy caches the parameter and result types it works out for a SQL
+/// text, and describes statements to clients from that cache. A column added,
+/// dropped or retyped underneath it would leave a client decoding rows against
+/// a description that no longer matches them, so anything that might do that
+/// empties the cache.
+///
+/// Only the leading keyword is examined, which is what distinguishes DDL from
+/// a query that merely mentions `create` in a string or a column name. It
+/// cannot see DDL run through `EXECUTE`, inside a function, or by anything
+/// that is not this proxy -- see the note in COMPATIBILITY.md.
+pub fn changes_schema(sql: &str) -> bool {
+    const DDL_KEYWORDS: [&str; 5] = ["CREATE", "ALTER", "DROP", "REINDEX", "REFRESH"];
+    match leading_words(sql, 1).first() {
+        Some(word) => DDL_KEYWORDS.contains(&word.as_str()),
+        None => false,
+    }
+}
+
 /// Whether the statement modifies data anywhere in its text.
 ///
 /// Used to decide whether a statement can safely be probed with
@@ -984,6 +1004,33 @@ mod tests {
         assert!(!modifies_data("SELECT * FROM t -- INSERT"));
         // ...and a column called `updated_at` must not trip it either.
         assert!(!modifies_data("SELECT updated_at FROM t"));
+    }
+
+    #[test]
+    fn detects_statements_that_reshape_the_schema() {
+        assert!(changes_schema("CREATE TABLE t (a int)"));
+        assert!(changes_schema("create table t (a int)"));
+        assert!(changes_schema("ALTER TABLE t ADD COLUMN b text"));
+        assert!(changes_schema("DROP VIEW v"));
+        assert!(changes_schema("  \n  CREATE INDEX i ON t (a)"));
+        assert!(changes_schema("-- a comment first\nDROP TABLE t"));
+        assert!(changes_schema("CREATE OR REPLACE VIEW v AS SELECT 1"));
+        assert!(changes_schema("REFRESH MATERIALIZED VIEW m"));
+    }
+
+    #[test]
+    fn leaves_the_cache_alone_for_statements_that_only_mention_ddl() {
+        assert!(!changes_schema("SELECT * FROM t"));
+        assert!(!changes_schema("INSERT INTO t VALUES (1)"));
+        // The keyword is only a keyword when it leads.
+        assert!(!changes_schema("SELECT 'CREATE TABLE t'"));
+        assert!(!changes_schema("SELECT created_at FROM t"));
+        assert!(!changes_schema("SELECT * FROM t WHERE x = 'DROP'"));
+        assert!(!changes_schema("UPDATE t SET altered = true"));
+        assert!(!changes_schema(""));
+        // The probe's own statements must not empty the cache it fills.
+        assert!(!changes_schema("PREPARE dapi_ps_1 AS SELECT 1"));
+        assert!(!changes_schema("SAVEPOINT dapi_probe_1"));
     }
 
     #[test]

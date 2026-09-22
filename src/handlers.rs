@@ -43,7 +43,7 @@ use crate::dataapi::{DataApi, Outcome};
 use crate::exec::{self, TxControl};
 use crate::params;
 use crate::probe;
-use crate::session::Session;
+use crate::session::{Session, SharedShapes};
 use crate::sql;
 use crate::types::CastScope;
 
@@ -96,22 +96,27 @@ impl QueryParser for ProxyQueryParser {
 pub struct ProxyHandler {
     api: DataApi,
     parser: Arc<ProxyQueryParser>,
+    /// Held here rather than on the session, because this is the one thing
+    /// every connection to this proxy has in common.
+    shapes: Arc<SharedShapes>,
 }
 
 impl ProxyHandler {
-    pub fn new(api: DataApi) -> Self {
+    pub fn new(api: DataApi, shapes: Arc<SharedShapes>) -> Self {
         Self {
             api,
             parser: Arc::new(ProxyQueryParser),
+            shapes,
         }
     }
 
     /// The per-connection state, created on first use.
     fn session<C: ClientInfo>(&self, client: &C) -> Arc<Session> {
         let api = self.api.clone();
+        let shapes = self.shapes.clone();
         client
             .session_extensions()
-            .get_or_insert_with(move || Session::new(api))
+            .get_or_insert_with(move || Session::new(api, shapes))
     }
 
     /// Run one statement and turn the result into a response.
@@ -148,10 +153,18 @@ impl ProxyHandler {
             return Err(e);
         }
 
-        match self
+        let outcome = self
             .execute_with_fallback(session, send_sql, params)
-            .await?
-        {
+            .await?;
+
+        // A statement that reshapes the schema invalidates what the proxy has
+        // worked out about every other statement. Forgetting afterwards rather
+        // than before means a DDL statement that failed leaves the cache alone.
+        if sql::changes_schema(raw_sql) {
+            session.forget_shapes().await;
+        }
+
+        match outcome {
             Outcome::Rows { columns, records } => {
                 exec::rows_response(raw_sql, &columns, &records, format)
             }
@@ -844,9 +857,17 @@ pub struct ProxyFactory {
 }
 
 impl ProxyFactory {
+    /// A factory whose connections share what they learn about statements.
     pub fn new(api: DataApi, server_version: String) -> Self {
+        Self::with_shapes(api, server_version, Arc::new(SharedShapes::shared()))
+    }
+
+    /// A factory over a given store, which is how `--describe-cache
+    /// connection` is expressed: hand it a store that holds nothing and every
+    /// connection is left with its own.
+    pub fn with_shapes(api: DataApi, server_version: String, shapes: Arc<SharedShapes>) -> Self {
         Self {
-            handler: Arc::new(ProxyHandler::new(api)),
+            handler: Arc::new(ProxyHandler::new(api, shapes)),
             startup: Arc::new(ProxyStartupHandler::new(server_version)),
         }
     }
