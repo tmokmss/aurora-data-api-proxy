@@ -184,5 +184,13 @@ things cost extra:
   statements from a stale cache. `--describe-cache connection` narrows that
   window to a single connection's lifetime, at the cost of probing again on
   every new connection.
+
+  The store holds a few thousand statements and drops the least recently used
+  to make room. That matters for a client that writes its values into the SQL
+  rather than binding them: `where id = 41` and `where id = 42` are two
+  statements as far as any cache is concerned -- PostgreSQL's own included --
+  so such a client fills the store with entries it will never ask for again.
+  Dropping the coldest means it costs those clients their own performance and
+  not everybody else's.
 - A scaled-to-zero cluster takes 10–30 seconds to wake. The proxy retries
   `DatabaseResumingException` with backoff for `--resume-timeout-secs`.
