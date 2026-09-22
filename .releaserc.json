@@ -15,7 +15,8 @@
         "assets": [
           { "path": "dist/*.tar.gz" },
           { "path": "dist/SHA256SUMS" }
-        ]
+        ],
+        "successCommentCondition": false
       }
     ]
   ]
