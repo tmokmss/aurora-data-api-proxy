@@ -133,9 +133,17 @@ twice.
 
 ## Performance
 
-Every statement is an HTTP round trip, so expect single-digit to low tens of
-milliseconds per query rather than the sub-millisecond of a local socket. Two
-things cost extra:
+Every statement is an HTTP round trip rather than the sub-millisecond of a local
+socket, and that round trip is nearly the whole cost: the proxy's own
+translation does not show up next to it.
+
+A query whose statement the connection has already seen costs the same as
+issuing it to the Data API yourself, to within a millisecond either way, and
+returning a thousand rows costs no more than returning one.
+[docs/benchmark.md](docs/benchmark.md) has the method, the numbers and what they
+do not cover.
+
+Two things cost extra, and only one of them is large:
 
 - **Answering `Describe(statement)`.** The Data API has no operation for "what
   shape is this statement", so the proxy asks PostgreSQL. What that costs
@@ -188,7 +196,7 @@ things cost extra:
   The store holds a few thousand statements and drops the least recently used
   to make room. That matters for a client that writes its values into the SQL
   rather than binding them: `where id = 41` and `where id = 42` are two
-  statements as far as any cache is concerned -- PostgreSQL's own included --
+  statements as far as any cache is concerned — PostgreSQL's own included —
   so such a client fills the store with entries it will never ask for again.
   Dropping the coldest means it costs those clients their own performance and
   not everybody else's.
