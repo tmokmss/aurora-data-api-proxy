@@ -129,21 +129,22 @@ pub async fn describe_statement(
 /// plain selects, catalogue tables, expression aliases, duplicate column names,
 /// CTEs and types the proxy maps to text -- and no rows.
 async fn one_call_is_enough(session: &Session, sql: &str) -> bool {
+    shape_query_stands_alone(sql) && session.transaction_id().await.is_none()
+}
+
+/// The part of [`one_call_is_enough`] that depends only on the statement.
+///
+/// Split out so that the three conditions on the text can be checked without a
+/// cluster, and so checked wherever the tests run rather than only where one
+/// is configured.
+fn shape_query_stands_alone(sql: &str) -> bool {
     const WRAPPABLE: [&str; 4] = ["SELECT", "WITH", "VALUES", "TABLE"];
 
-    if sql::rewrite_placeholders(sql).param_count != 0 {
-        return false;
-    }
-    if sql::modifies_data(sql) {
-        return false;
-    }
-    if !sql::leading_words(sql, 1)
-        .first()
-        .is_some_and(|word| WRAPPABLE.contains(&word.as_str()))
-    {
-        return false;
-    }
-    session.transaction_id().await.is_none()
+    sql::rewrite_placeholders(sql).param_count == 0
+        && !sql::modifies_data(sql)
+        && sql::leading_words(sql, 1)
+            .first()
+            .is_some_and(|word| WRAPPABLE.contains(&word.as_str()))
 }
 
 /// Work out a shape, and say whether the answer belongs to the schema.
@@ -484,5 +485,91 @@ mod tests {
         let a = unique_suffix();
         let b = unique_suffix();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn one_call_answers_a_read_with_no_placeholders() {
+        assert!(shape_query_stands_alone("SELECT 1"));
+        assert!(shape_query_stands_alone("select a, b from t where c = 'x'"));
+        assert!(shape_query_stands_alone(
+            "WITH x AS (SELECT 1) SELECT * FROM x"
+        ));
+        assert!(shape_query_stands_alone("VALUES (1, 'a')"));
+        assert!(shape_query_stands_alone("TABLE t"));
+        assert!(shape_query_stands_alone("  -- a comment\n  SELECT 1"));
+        // A literal that looks like a placeholder is not one.
+        assert!(shape_query_stands_alone("SELECT '$1'"));
+    }
+
+    #[test]
+    fn a_placeholder_forces_the_long_way() {
+        // The wrap needs a typed NULL here, and the type comes from PREPARE.
+        assert!(!shape_query_stands_alone("SELECT $1"));
+        assert!(!shape_query_stands_alone("select * from t where a = $1"));
+        assert!(!shape_query_stands_alone("select $2, $1"));
+    }
+
+    #[test]
+    fn a_write_forces_the_long_way() {
+        // A write cannot be wrapped in a subquery, and wrapping it in a
+        // data-modifying CTE performs the write.
+        assert!(!shape_query_stands_alone("INSERT INTO t VALUES (1)"));
+        assert!(!shape_query_stands_alone("UPDATE t SET a = 1"));
+        assert!(!shape_query_stands_alone("DELETE FROM t"));
+        assert!(!shape_query_stands_alone(
+            "WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x"
+        ));
+        // `FOR UPDATE` takes locks, so the wrap is not free of consequences.
+        assert!(!shape_query_stands_alone("select * from t for update"));
+    }
+
+    #[test]
+    fn a_statement_a_subquery_cannot_hold_forces_the_long_way() {
+        assert!(!shape_query_stands_alone("SHOW server_version"));
+        assert!(!shape_query_stands_alone("EXPLAIN SELECT 1"));
+        assert!(!shape_query_stands_alone("SET search_path = public"));
+        assert!(!shape_query_stands_alone("CREATE TABLE t (a int)"));
+        assert!(!shape_query_stands_alone("BEGIN"));
+        assert!(!shape_query_stands_alone(""));
+    }
+
+    /// Inside a transaction the short way is refused whatever the statement is.
+    ///
+    /// A statement that does not compile aborts a PostgreSQL transaction, and
+    /// describing a statement that does not compile is an ordinary thing for a
+    /// client to do. The long way runs behind a savepoint for that reason; the
+    /// short way has no savepoint to hide behind.
+    #[tokio::test]
+    async fn an_open_transaction_refuses_the_short_way() {
+        let session = offline_session();
+        assert!(
+            one_call_is_enough(&session, "SELECT 1").await,
+            "with no transaction open there is nothing to protect"
+        );
+
+        session.adopt_transaction("tx-1".to_string()).await;
+        assert!(
+            !one_call_is_enough(&session, "SELECT 1").await,
+            "the caller's transaction must not be put at risk to save four calls"
+        );
+    }
+
+    /// A session with no credentials and nothing to talk to.
+    fn offline_session() -> Session {
+        use crate::dataapi::DataApi;
+        use crate::session::SharedShapes;
+
+        let conf = aws_sdk_rdsdata::Config::builder()
+            .behavior_version(aws_sdk_rdsdata::config::BehaviorVersion::latest())
+            .region(aws_sdk_rdsdata::config::Region::new("us-east-1"))
+            .build();
+        let api = DataApi::new(
+            aws_sdk_rdsdata::Client::from_conf(conf),
+            "arn:aws:rds:us-east-1:1:cluster:c".into(),
+            "arn:aws:secretsmanager:us-east-1:1:secret:s".into(),
+            "postgres".into(),
+            std::time::Duration::from_secs(1),
+        );
+        Session::new(api, Arc::new(SharedShapes::shared()))
     }
 }

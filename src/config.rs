@@ -14,6 +14,16 @@ pub enum DescribeCache {
     Connection,
 }
 
+impl DescribeCache {
+    /// Whether connections may use what another connection worked out.
+    ///
+    /// This is the whole of what the setting does, so it is the whole of what
+    /// there is to get wrong.
+    pub fn shares(self) -> bool {
+        matches!(self, DescribeCache::Process)
+    }
+}
+
 /// Speak the PostgreSQL wire protocol on a local socket and forward queries to
 /// an Aurora cluster over the RDS Data API.
 #[derive(Parser, Debug, Clone)]
@@ -117,6 +127,12 @@ mod tests {
         assert!(config("127.0.0.1:5432").listens_on_loopback());
         assert!(config("[::1]:5432").listens_on_loopback());
         assert!(config("localhost:5432").listens_on_loopback());
+    }
+
+    #[test]
+    fn the_describe_cache_setting_means_what_it_says() {
+        assert!(DescribeCache::Process.shares());
+        assert!(!DescribeCache::Connection.shares());
     }
 
     #[test]

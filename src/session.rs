@@ -64,20 +64,22 @@ pub struct SharedShapes {
 }
 
 impl SharedShapes {
-    /// A store that connections share.
-    pub fn shared() -> Self {
+    /// A store, sharing or not.
+    pub fn new(shared: bool) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            shared: true,
+            shared,
         }
+    }
+
+    /// A store that connections share.
+    pub fn shared() -> Self {
+        Self::new(true)
     }
 
     /// A store that never holds anything, leaving each connection its own.
     pub fn disabled() -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-            shared: false,
-        }
+        Self::new(false)
     }
 
     async fn get(&self, sql: &str) -> Option<Arc<StatementShape>> {
@@ -386,5 +388,107 @@ mod tests {
         shapes.insert("select 1".into(), shape("int4")).await;
         shapes.clear().await;
         assert!(shapes.get("select 1").await.is_none());
+    }
+
+    /// A session with no credentials and nothing to talk to.
+    ///
+    /// Building the SDK client does no I/O, so the parts of a session that are
+    /// only bookkeeping -- which store an answer goes into, and which one it
+    /// comes back out of -- can be decided without a cluster, and therefore
+    /// checked in CI rather than only on a machine that has one.
+    fn offline_session(shapes: Arc<SharedShapes>) -> Session {
+        let conf = aws_sdk_rdsdata::Config::builder()
+            .behavior_version(aws_sdk_rdsdata::config::BehaviorVersion::latest())
+            .region(aws_sdk_rdsdata::config::Region::new("us-east-1"))
+            .build();
+        let api = DataApi::new(
+            aws_sdk_rdsdata::Client::from_conf(conf),
+            "arn:aws:rds:us-east-1:1:cluster:c".into(),
+            "arn:aws:secretsmanager:us-east-1:1:secret:s".into(),
+            "postgres".into(),
+            std::time::Duration::from_secs(1),
+        );
+        Session::new(api, shapes)
+    }
+
+    #[tokio::test]
+    async fn a_shareable_answer_reaches_the_next_connection() {
+        let shapes = Arc::new(SharedShapes::shared());
+        let first = offline_session(shapes.clone());
+        let second = offline_session(shapes.clone());
+
+        first
+            .cache_shape("select 1".into(), shape("int4"), true)
+            .await;
+
+        let found = second.cached_shape("select 1").await.expect("the shape");
+        assert_eq!(found.param_types, vec![Some("int4".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_learned_inside_a_transaction_is_not_lent_out() {
+        let shapes = Arc::new(SharedShapes::shared());
+        let first = offline_session(shapes.clone());
+        let second = offline_session(shapes.clone());
+
+        first
+            .cache_shape("select 1".into(), shape("int4"), false)
+            .await;
+
+        assert!(
+            first.cached_shape("select 1").await.is_some(),
+            "the connection that worked it out should still have it"
+        );
+        assert!(
+            second.cached_shape("select 1").await.is_none(),
+            "a SET LOCAL, a temporary table or uncommitted DDL are visible only \
+             inside the transaction that made them, so an answer learned there \
+             cannot be handed to another connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_prefers_its_own_answer_to_the_shared_one() {
+        let shapes = Arc::new(SharedShapes::shared());
+        let session = offline_session(shapes.clone());
+
+        shapes
+            .insert("select 1".into(), shape("from the store"))
+            .await;
+        session
+            .cache_shape("select 1".into(), shape("its own"), false)
+            .await;
+
+        let found = session.cached_shape("select 1").await.expect("the shape");
+        assert_eq!(
+            found.param_types,
+            vec![Some("its own".to_string())],
+            "what this connection worked out in its own transaction is the more \
+             specific answer, and has to win"
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_empties_the_connection_and_the_process() {
+        let shapes = Arc::new(SharedShapes::shared());
+        let session = offline_session(shapes.clone());
+        let other = offline_session(shapes.clone());
+
+        session
+            .cache_shape("shared".into(), shape("int4"), true)
+            .await;
+        session
+            .cache_shape("private".into(), shape("int4"), false)
+            .await;
+
+        session.forget_shapes().await;
+
+        assert!(session.cached_shape("shared").await.is_none());
+        assert!(session.cached_shape("private").await.is_none());
+        assert!(
+            other.cached_shape("shared").await.is_none(),
+            "DDL changes the schema for everyone, so it has to invalidate for everyone"
+        );
+        assert!(shapes.is_empty().await);
     }
 }
